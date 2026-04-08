@@ -48,13 +48,12 @@ assert(
 );
 
 const next = stepSimulation(generated, {
-  signalDeposit: 0,
   random: () => 0.99,
 });
 assert(next.tick === 1, 'stepSimulation must increment tick');
 assert(
   next.signalFields.length === 0,
-  'Idle termites should not flood the world with signal fields every step.',
+  'Classic termite model should not emit persistent signal fields.',
 );
 
 const localState = {
@@ -85,25 +84,31 @@ assert(perception.nearbyWoodchips.length === 1, 'Perception should include only 
 assert(perception.nearbyWoodchips[0]?.id === 'near', 'Perception should select the nearest local chip.');
 assert(perception.nearbySignals.length === 1, 'Perception should include only nearby signal fields by radius.');
 
-const signalOnly = {
-  ...localState,
-  signalFields: [{ id: 'signal', x: 50, y: 60, intensity: 1 }],
-  termites: [
-    {
-      id: 'mover',
-      x: 30,
-      y: 30,
-      heading: 0,
-      carriedChipId: 'payload',
-    },
-  ],
-  woodchips: [{ id: 'payload', x: 30, y: 30, collected: true }],
-};
-
-const decayed = stepSimulation(signalOnly, { signalDecay: 0.4, signalDeposit: 0, minSignalIntensity: 0.1, perceptionRadius: 30 });
+const wrapped = stepSimulation(
+  {
+    isInitialized: true,
+    tick: 0,
+    world,
+    termites: [
+      {
+        id: 'wrapper',
+        x: 199,
+        y: 90,
+        heading: 0,
+        carriedChipId: null,
+      },
+    ],
+    woodchips: [],
+    signalFields: [],
+  },
+  {
+    moveDistance: 4,
+    random: () => 0.5,
+  },
+);
 assert(
-  decayed.signalFields.some((field) => Math.abs(field.intensity - 0.4) < 0.0001),
-  'Signals should preserve and decay local fields consistently each tick',
+  wrapped.termites[0].x < 10,
+  'Random wandering termites should wrap around world bounds.',
 );
 
-console.log('US-002 focused verification passed: local-perception + bounded regeneration + signal updates.');
+console.log('US-002 focused verification passed: local perception, bounded regeneration, and wraparound movement.');

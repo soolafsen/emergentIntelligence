@@ -12,6 +12,8 @@ import { ControlsPanel } from './ui/controls/ControlsPanel';
 const WORLD_WIDTH = 760;
 const WORLD_HEIGHT = 420;
 const MIN_TICK_INTERVAL_MS = 16;
+const MAX_SPEED = 10000;
+const FAST_FORWARD_STEPS = 5000;
 const CLUSTER_RADIUS = 30;
 
 const DASHBOARD_CARDS = [
@@ -27,9 +29,6 @@ interface SimulationControls {
   termiteCount: number;
   woodchipCount: number;
   speed: number;
-  perceptionRadius: number;
-  chipPickupBias: number;
-  chipDropBias: number;
 }
 
 interface ThroughputStats {
@@ -46,9 +45,6 @@ const DEFAULT_CONTROLS: SimulationControls = {
   termiteCount: 60,
   woodchipCount: 160,
   speed: 12,
-  perceptionRadius: 70,
-  chipPickupBias: 0.35,
-  chipDropBias: 0.2,
 };
 
 const DEFAULT_THROUGHPUT: ThroughputStats = {
@@ -69,16 +65,22 @@ function clampControls(values: SimulationControls): SimulationControls {
   return {
     termiteCount: Math.round(clamp(values.termiteCount, 1, 500)),
     woodchipCount: Math.round(clamp(values.woodchipCount, 0, 1000)),
-    speed: clamp(values.speed, 1, 60),
-    perceptionRadius: clamp(values.perceptionRadius, 10, 220),
-    chipPickupBias: clamp(values.chipPickupBias, 0, 1),
-    chipDropBias: clamp(values.chipDropBias, 0, 1),
+    speed: clamp(values.speed, 1, MAX_SPEED),
   };
 }
 
-function buildIntervalMs(speed: number): number {
-  const safeSpeed = clamp(speed, 1, 60);
-  return Math.max(MIN_TICK_INTERVAL_MS, Math.floor(1000 / safeSpeed));
+function buildScheduler(speed: number): { intervalMs: number; stepsPerFrame: number } {
+  const safeSpeed = clamp(speed, 1, MAX_SPEED);
+  const rawIntervalMs = Math.floor(1000 / safeSpeed);
+
+  if (rawIntervalMs >= MIN_TICK_INTERVAL_MS) {
+    return { intervalMs: rawIntervalMs, stepsPerFrame: 1 };
+  }
+
+  return {
+    intervalMs: MIN_TICK_INTERVAL_MS,
+    stepsPerFrame: Math.max(1, Math.round((safeSpeed * MIN_TICK_INTERVAL_MS) / 1000)),
+  };
 }
 
 function createSimulationStateFromControls(
@@ -219,6 +221,41 @@ function drawWorld(context: CanvasRenderingContext2D | null, state: SimulationSt
   context.strokeRect(0.5, 0.5, world.width - 1, world.height - 1);
 }
 
+function advanceSimulationBatch(
+  currentState: SimulationState,
+  steps: number,
+): {
+  nextState: SimulationState;
+  throughputDelta: ThroughputStats;
+  nextClusterMetrics: ClusterMetrics;
+} {
+  let workingState = currentState;
+  let totalPickups = 0;
+  let totalDrops = 0;
+
+  for (let step = 0; step < steps; step += 1) {
+    const nextState = stepSimulation(workingState, {});
+    const transitions = computePickupAndDropEvents(workingState.termites, nextState.termites);
+    totalPickups += transitions.pickups;
+    totalDrops += transitions.drops;
+    workingState = nextState;
+  }
+
+  const nextDensity = computeLocalClusterDensity(workingState.woodchips);
+
+  return {
+    nextState: workingState,
+    throughputDelta: {
+      pickups: totalPickups,
+      drops: totalDrops,
+    },
+    nextClusterMetrics: {
+      density: nextDensity,
+      trend: 0,
+    },
+  };
+}
+
 export function App() {
   const [controls, setControls] = useState<SimulationControls>(DEFAULT_CONTROLS);
   const [isRunning, setIsRunning] = useState(true);
@@ -240,29 +277,23 @@ export function App() {
     }
 
     const sanitizedControls = clampControls(controls);
-    const intervalMs = buildIntervalMs(sanitizedControls.speed);
+    const { intervalMs, stepsPerFrame } = buildScheduler(sanitizedControls.speed);
 
     const timer = window.setInterval(() => {
       setState((currentState) => {
-        const nextState = stepSimulation(currentState, {
-          perceptionRadius: sanitizedControls.perceptionRadius,
-          chipPickupBias: sanitizedControls.chipPickupBias,
-          chipDropBias: sanitizedControls.chipDropBias,
-        });
+        const batch = advanceSimulationBatch(currentState, stepsPerFrame);
 
-        const transitions = computePickupAndDropEvents(currentState.termites, nextState.termites);
         setThroughput((currentThroughput) => ({
-          pickups: currentThroughput.pickups + transitions.pickups,
-          drops: currentThroughput.drops + transitions.drops,
+          pickups: currentThroughput.pickups + batch.throughputDelta.pickups,
+          drops: currentThroughput.drops + batch.throughputDelta.drops,
         }));
 
-        const nextDensity = computeLocalClusterDensity(nextState.woodchips);
         setClusterMetrics((current) => ({
-          density: nextDensity,
-          trend: Number(formatFloat(nextDensity - current.density)),
+          density: batch.nextClusterMetrics.density,
+          trend: Number(formatFloat(batch.nextClusterMetrics.density - current.density)),
         }));
 
-        return nextState;
+        return batch.nextState;
       });
     }, intervalMs);
 
@@ -272,9 +303,6 @@ export function App() {
   }, [
     isRunning,
     controls.speed,
-    controls.perceptionRadius,
-    controls.chipPickupBias,
-    controls.chipDropBias,
   ]);
 
   useEffect(() => {
@@ -324,13 +352,28 @@ export function App() {
     setIsRunning((running) => !running);
   }
 
+  function handleFastForward(): void {
+    setState((currentState) => {
+      const batch = advanceSimulationBatch(currentState, FAST_FORWARD_STEPS);
+      setThroughput((currentThroughput) => ({
+        pickups: currentThroughput.pickups + batch.throughputDelta.pickups,
+        drops: currentThroughput.drops + batch.throughputDelta.drops,
+      }));
+      setClusterMetrics((current) => ({
+        density: batch.nextClusterMetrics.density,
+        trend: Number(formatFloat(batch.nextClusterMetrics.density - current.density)),
+      }));
+      return batch.nextState;
+    });
+  }
+
   return (
     <main className="app-shell">
       <header className="hero">
         <p className="eyebrow">Emergent Intelligence Sandbox</p>
         <h1>Termites and Woodchips</h1>
         <p className="intro">
-          Simple local rules, no global map, and just enough signaling to let visible structure emerge.
+          Random wandering, chip pickup on contact, and local drop rules based on the classic termite model.
         </p>
       </header>
 
@@ -419,47 +462,11 @@ export function App() {
             <input
               type="range"
               min={1}
-              max={60}
+              max={MAX_SPEED}
               step={1}
               value={controls.speed}
               onChange={(event) => updateControl('speed', Number(event.target.value))}
               data-testid="control-speed"
-            />
-          </label>
-          <label>
-            Perception radius: {controls.perceptionRadius}
-            <input
-              type="range"
-              min={10}
-              max={220}
-              step={1}
-              value={controls.perceptionRadius}
-              onChange={(event) => updateControl('perceptionRadius', Number(event.target.value))}
-              data-testid="control-perception-radius"
-            />
-          </label>
-          <label>
-            Pickup bias: {controls.chipPickupBias.toFixed(2)}
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={controls.chipPickupBias}
-              onChange={(event) => updateControl('chipPickupBias', Number(event.target.value))}
-              data-testid="control-chip-pickup"
-            />
-          </label>
-          <label>
-            Drop bias: {controls.chipDropBias.toFixed(2)}
-            <input
-              type="range"
-              min={0}
-              max={1}
-              step={0.01}
-              value={controls.chipDropBias}
-              onChange={(event) => updateControl('chipDropBias', Number(event.target.value))}
-              data-testid="control-chip-drop"
             />
           </label>
           <div className="control-actions">
@@ -469,6 +476,9 @@ export function App() {
             <button type="button" onClick={handleRegenerate} data-testid="control-regenerate">
               Regenerate
             </button>
+            <button type="button" onClick={handleFastForward} data-testid="control-fast-forward">
+              Fast-forward
+            </button>
             <button type="button" onClick={handleTogglePlayback} data-testid="control-playback">
               {isRunning ? 'Pause' : 'Resume'}
             </button>
@@ -476,7 +486,7 @@ export function App() {
         </div>
         <p className="metric-row" data-testid="tick-metric">
           Tick {state.tick} | termites {state.termites.length} | chips {visibleWoodchips} | carried chips {carriedChips} | pickups{' '}
-          {throughput.pickups} | drops {throughput.drops} | local signals {state.signalFields.length} | cluster density{' '}
+          {throughput.pickups} | drops {throughput.drops} | cluster density{' '}
           {formatFloat(clusterMetrics.density)} ({trendLabel})
         </p>
       </ControlsPanel>
