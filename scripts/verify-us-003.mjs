@@ -73,7 +73,7 @@ const pickupCandidateState = {
   woodchips: [
     {
       id: 'chip-1',
-      x: 52,
+      x: 50,
       y: 50,
       collected: false,
     },
@@ -117,7 +117,7 @@ const dropState = {
     },
     {
       id: 'chip-2',
-      x: 102,
+      x: 100,
       y: 100,
       collected: false,
     },
@@ -149,6 +149,10 @@ assert(
   droppedChip &&
     Math.hypot(droppedChip.x - dropState.woodchips[1].x, droppedChip.y - dropState.woodchips[1].y) <= 14,
   'Dropped chip should land near the chip that triggered the drop.',
+);
+assert(
+  Math.hypot(dropped.termites[0].x - dropState.termites[0].x, dropped.termites[0].y - dropState.termites[0].y) > 1,
+  'After dropping, the termite should displace away from the local pile.',
 );
 
 console.log('US-003 focused verification passed: wandering, pickup on contact, and nearby empty-space drops.');

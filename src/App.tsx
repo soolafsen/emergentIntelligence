@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import './App.css';
 import {
+  advanceSimulation,
   createSimulationState,
-  stepSimulation,
   type SimulationState,
   type Termite,
   type Woodchip,
@@ -11,10 +11,12 @@ import { ControlsPanel } from './ui/controls/ControlsPanel';
 
 const WORLD_WIDTH = 760;
 const WORLD_HEIGHT = 420;
+const WORLD_CELL_SIZE = 6;
+const LOGICAL_WORLD_WIDTH = Math.floor(WORLD_WIDTH / WORLD_CELL_SIZE);
+const LOGICAL_WORLD_HEIGHT = Math.floor(WORLD_HEIGHT / WORLD_CELL_SIZE);
 const MIN_TICK_INTERVAL_MS = 16;
 const MAX_SPEED = 10000;
 const FAST_FORWARD_STEPS = 5000;
-const CLUSTER_RADIUS = 30;
 
 const DASHBOARD_CARDS = [
   'Total termites',
@@ -37,7 +39,8 @@ interface ThroughputStats {
 }
 
 interface ClusterMetrics {
-  density: number;
+  largestPileShare: number;
+  pileCount: number;
   trend: number;
 }
 
@@ -53,7 +56,8 @@ const DEFAULT_THROUGHPUT: ThroughputStats = {
 };
 
 const EMPTY_CLUSTER_METRICS: ClusterMetrics = {
-  density: 0,
+  largestPileShare: 0,
+  pileCount: 0,
   trend: 0,
 };
 
@@ -89,7 +93,7 @@ function createSimulationStateFromControls(
 ): SimulationState {
   const normalizedControls = clampControls(controls);
   return createSimulationState({
-    world: { width: WORLD_WIDTH, height: WORLD_HEIGHT },
+    world: { width: LOGICAL_WORLD_WIDTH, height: LOGICAL_WORLD_HEIGHT },
     termiteCount: includePopulation ? normalizedControls.termiteCount : 0,
     woodchipCount: includePopulation ? normalizedControls.woodchipCount : 0,
   });
@@ -105,53 +109,68 @@ function countCarriedChips(termites: Termite[]): number {
   return termites.reduce((count, termite) => count + (termite.carriedChipId === null ? 0 : 1), 0);
 }
 
-function computePickupAndDropEvents(previous: Termite[], next: Termite[]): ThroughputStats {
-  const previousCarrierById = new Map(previous.map((termite) => [termite.id, termite.carriedChipId]));
-
-  let pickups = 0;
-  let drops = 0;
-
-  for (const nextTermite of next) {
-    const previousCarrier = previousCarrierById.get(nextTermite.id);
-
-    if (previousCarrier === undefined) {
-      continue;
-    }
-
-    if (previousCarrier === null && nextTermite.carriedChipId !== null) {
-      pickups += 1;
-      continue;
-    }
-
-    if (previousCarrier !== null && nextTermite.carriedChipId === null) {
-      drops += 1;
-    }
-  }
-
-  return { pickups, drops };
+function makeCellKey(cellX: number, cellY: number): string {
+  return `${cellX},${cellY}`;
 }
 
-function computeLocalClusterDensity(woodchips: Woodchip[]): number {
+function computeClusterMetrics(woodchips: Woodchip[]): ClusterMetrics {
   const visibleWoodchips = woodchips.filter((chip) => !chip.collected);
 
-  if (visibleWoodchips.length < 2) {
-    return 0;
+  if (visibleWoodchips.length === 0) {
+    return EMPTY_CLUSTER_METRICS;
   }
 
-  const clusterRadiusSq = CLUSTER_RADIUS * CLUSTER_RADIUS;
-  let pairConnections = 0;
+  const cellCounts = new Map<string, number>();
 
-  for (let i = 0; i < visibleWoodchips.length - 1; i += 1) {
-    const source = visibleWoodchips[i];
-    for (let j = i + 1; j < visibleWoodchips.length; j += 1) {
-      const target = visibleWoodchips[j];
-      if (distanceSq(source.x, source.y, target.x, target.y) <= clusterRadiusSq) {
-        pairConnections += 1;
+  for (const chip of visibleWoodchips) {
+    const key = makeCellKey(chip.x, chip.y);
+    cellCounts.set(key, (cellCounts.get(key) ?? 0) + 1);
+  }
+
+  const visited = new Set<string>();
+  let largestPile = 0;
+  let pileCount = 0;
+
+  for (const [startKey] of cellCounts) {
+    if (visited.has(startKey)) {
+      continue;
+    }
+
+    pileCount += 1;
+    let pileSize = 0;
+    const queue = [startKey];
+    visited.add(startKey);
+
+    while (queue.length > 0) {
+      const currentKey = queue.pop();
+      if (currentKey === undefined) {
+        continue;
+      }
+
+      pileSize += cellCounts.get(currentKey) ?? 0;
+      const [cellX, cellY] = currentKey.split(',').map(Number);
+
+      for (let deltaX = -1; deltaX <= 1; deltaX += 1) {
+        for (let deltaY = -1; deltaY <= 1; deltaY += 1) {
+          const neighborKey = makeCellKey(cellX + deltaX, cellY + deltaY);
+          if (!cellCounts.has(neighborKey) || visited.has(neighborKey)) {
+            continue;
+          }
+
+          visited.add(neighborKey);
+          queue.push(neighborKey);
+        }
       }
     }
+
+    largestPile = Math.max(largestPile, pileSize);
   }
 
-  return Number(((pairConnections * 2) / visibleWoodchips.length).toFixed(2));
+  return {
+    largestPileShare: Number(((largestPile / visibleWoodchips.length) * 100).toFixed(2)),
+    pileCount,
+    trend: 0,
+  };
 }
 
 function formatFloat(value: number): string {
@@ -167,58 +186,41 @@ function drawWorld(context: CanvasRenderingContext2D | null, state: SimulationSt
     return;
   }
 
-  const { world, termites, woodchips, signalFields } = state;
-  const maxSignalsRendered = 700;
-  const signalSampleStep =
-    signalFields.length > maxSignalsRendered ? Math.ceil(signalFields.length / maxSignalsRendered) : 1;
+  const { world, termites, woodchips } = state;
+  const pixelWidth = world.width * WORLD_CELL_SIZE;
+  const pixelHeight = world.height * WORLD_CELL_SIZE;
 
-  context.clearRect(0, 0, world.width, world.height);
+  context.clearRect(0, 0, pixelWidth, pixelHeight);
 
   context.fillStyle = '#f2f5ff';
-  context.fillRect(0, 0, world.width, world.height);
+  context.fillRect(0, 0, pixelWidth, pixelHeight);
 
-  for (let i = 0; i < signalFields.length; i += signalSampleStep) {
-    const signal = signalFields[i];
-    const alpha = Math.min(0.22, 0.08 + signal.intensity * 0.45);
-    context.fillStyle = `rgba(244, 114, 182, ${alpha})`;
-    context.beginPath();
-    const radius = Math.max(1.2, Math.min(3.5, 0.9 + signal.intensity * 4));
-    context.arc(signal.x, signal.y, radius, 0, Math.PI * 2);
-    context.fill();
-  }
-
+  context.fillStyle = '#4c6ef5';
   for (const chip of woodchips) {
     if (chip.collected) {
       continue;
     }
 
-    context.fillStyle = '#4c6ef5';
-    context.fillRect(chip.x - 2, chip.y - 2, 4, 4);
+    context.fillRect(
+      chip.x * WORLD_CELL_SIZE + WORLD_CELL_SIZE / 2 - 1.5,
+      chip.y * WORLD_CELL_SIZE + WORLD_CELL_SIZE / 2 - 1.5,
+      3,
+      3,
+    );
   }
 
+  context.fillStyle = '#ff9f1c';
   for (const termite of termites) {
-    context.fillStyle = '#ff9f1c';
-    context.beginPath();
-    context.arc(termite.x, termite.y, 3, 0, Math.PI * 2);
-    context.fill();
-
-    context.fillStyle = '#111';
-    context.beginPath();
-    context.arc(termite.x - 0.5, termite.y - 0.5, 1, 0, Math.PI * 2);
-    context.fill();
-
-    context.strokeStyle = '#c77d00';
-    context.beginPath();
-    context.moveTo(termite.x, termite.y);
-    context.lineTo(
-      termite.x + Math.cos(termite.heading) * 8,
-      termite.y + Math.sin(termite.heading) * 8,
+    context.fillRect(
+      termite.x * WORLD_CELL_SIZE + WORLD_CELL_SIZE / 2 - 1.5,
+      termite.y * WORLD_CELL_SIZE + WORLD_CELL_SIZE / 2 - 1.5,
+      3,
+      3,
     );
-    context.stroke();
   }
 
   context.strokeStyle = '#222';
-  context.strokeRect(0.5, 0.5, world.width - 1, world.height - 1);
+  context.strokeRect(0.5, 0.5, pixelWidth - 1, pixelHeight - 1);
 }
 
 function advanceSimulationBatch(
@@ -229,30 +231,16 @@ function advanceSimulationBatch(
   throughputDelta: ThroughputStats;
   nextClusterMetrics: ClusterMetrics;
 } {
-  let workingState = currentState;
-  let totalPickups = 0;
-  let totalDrops = 0;
-
-  for (let step = 0; step < steps; step += 1) {
-    const nextState = stepSimulation(workingState, {});
-    const transitions = computePickupAndDropEvents(workingState.termites, nextState.termites);
-    totalPickups += transitions.pickups;
-    totalDrops += transitions.drops;
-    workingState = nextState;
-  }
-
-  const nextDensity = computeLocalClusterDensity(workingState.woodchips);
+  const result = advanceSimulation(currentState, steps, {});
+  const nextMetrics = computeClusterMetrics(result.state.woodchips);
 
   return {
-    nextState: workingState,
+    nextState: result.state,
     throughputDelta: {
-      pickups: totalPickups,
-      drops: totalDrops,
+      pickups: result.pickups,
+      drops: result.drops,
     },
-    nextClusterMetrics: {
-      density: nextDensity,
-      trend: 0,
-    },
+    nextClusterMetrics: nextMetrics,
   };
 }
 
@@ -289,8 +277,9 @@ export function App() {
         }));
 
         setClusterMetrics((current) => ({
-          density: batch.nextClusterMetrics.density,
-          trend: Number(formatFloat(batch.nextClusterMetrics.density - current.density)),
+          largestPileShare: batch.nextClusterMetrics.largestPileShare,
+          pileCount: batch.nextClusterMetrics.pileCount,
+          trend: Number(formatFloat(batch.nextClusterMetrics.largestPileShare - current.largestPileShare)),
         }));
 
         return batch.nextState;
@@ -360,8 +349,9 @@ export function App() {
         drops: currentThroughput.drops + batch.throughputDelta.drops,
       }));
       setClusterMetrics((current) => ({
-        density: batch.nextClusterMetrics.density,
-        trend: Number(formatFloat(batch.nextClusterMetrics.density - current.density)),
+        largestPileShare: batch.nextClusterMetrics.largestPileShare,
+        pileCount: batch.nextClusterMetrics.pileCount,
+        trend: Number(formatFloat(batch.nextClusterMetrics.largestPileShare - current.largestPileShare)),
       }));
       return batch.nextState;
     });
@@ -421,14 +411,15 @@ export function App() {
             </article>
           ))}
           <article className="metric-card metric-card--cluster">
-            <p className="metric-label">Cluster density</p>
+            <p className="metric-label">Largest pile share</p>
             <p className="metric-value">
-              {formatFloat(clusterMetrics.density)}
+              {formatFloat(clusterMetrics.largestPileShare)}%
               <span className="trend-indicator" aria-live="polite">
                 {' '}
                 ({trendLabel})
               </span>
             </p>
+            <p className="metric-label">Estimated piles: {clusterMetrics.pileCount}</p>
           </article>
         </section>
 
@@ -486,8 +477,8 @@ export function App() {
         </div>
         <p className="metric-row" data-testid="tick-metric">
           Tick {state.tick} | termites {state.termites.length} | chips {visibleWoodchips} | carried chips {carriedChips} | pickups{' '}
-          {throughput.pickups} | drops {throughput.drops} | cluster density{' '}
-          {formatFloat(clusterMetrics.density)} ({trendLabel})
+          {throughput.pickups} | drops {throughput.drops} | largest pile {formatFloat(clusterMetrics.largestPileShare)}% | piles{' '}
+          {clusterMetrics.pileCount} ({trendLabel})
         </p>
       </ControlsPanel>
     </main>

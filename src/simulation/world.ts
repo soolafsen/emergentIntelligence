@@ -44,6 +44,12 @@ export interface Perception {
   nearbySignals: SignalField[];
 }
 
+export interface AdvanceResult {
+  state: SimulationState;
+  pickups: number;
+  drops: number;
+}
+
 export interface StepOptions {
   perceptionRadius?: number;
   moveDistance?: number;
@@ -63,35 +69,46 @@ export interface StepOptions {
 
 const MIN_SIGNAL_INTENSITY = 0.01;
 const TWO_PI = Math.PI * 2;
+const DEFAULT_MOVE_DISTANCE = 1;
 const DEFAULT_PERCEPTION_RADIUS = 70;
-const DEFAULT_MOVE_DISTANCE = 1.8;
-const DEFAULT_PICKUP_RADIUS = 14;
-const DEFAULT_DROP_CLUSTER_RADIUS = 18;
-const DEFAULT_WANDER_JITTER = 0.8;
+const POST_DROP_DISPLACEMENT = 20;
+
+const DIRECTIONS = [
+  { dx: -1, dy: -1, heading: -3 * Math.PI / 4 },
+  { dx: 0, dy: -1, heading: -Math.PI / 2 },
+  { dx: 1, dy: -1, heading: -Math.PI / 4 },
+  { dx: 1, dy: 0, heading: 0 },
+  { dx: 1, dy: 1, heading: Math.PI / 4 },
+  { dx: 0, dy: 1, heading: Math.PI / 2 },
+  { dx: -1, dy: 1, heading: 3 * Math.PI / 4 },
+  { dx: -1, dy: 0, heading: Math.PI },
+] as const;
 
 let nextId = 0;
-
-function normalizeAngle(angle: number): number {
-  while (angle <= -Math.PI) {
-    angle += TWO_PI;
-  }
-  while (angle > Math.PI) {
-    angle -= TWO_PI;
-  }
-  return angle;
-}
 
 function makeId(prefix: string): string {
   nextId += 1;
   return `${prefix}-${nextId}`;
 }
 
-function randomInRange(random: () => number, min: number, max: number): number {
-  return random() * (max - min) + min;
-}
-
 function clamp(value: number, min: number, max: number): number {
   return Math.min(max, Math.max(min, value));
+}
+
+function normalizeWorld(world: WorldDimensions): { width: number; height: number } {
+  return {
+    width: Math.max(1, Math.floor(world.width)),
+    height: Math.max(1, Math.floor(world.height)),
+  };
+}
+
+function wrapCoordinate(value: number, maxExclusive: number): number {
+  const wrapped = value % maxExclusive;
+  return wrapped < 0 ? wrapped + maxExclusive : wrapped;
+}
+
+function cellKey(x: number, y: number, width: number): number {
+  return y * width + x;
 }
 
 function distanceSq(aX: number, aY: number, bX: number, bY: number): number {
@@ -100,59 +117,143 @@ function distanceSq(aX: number, aY: number, bX: number, bY: number): number {
   return dx * dx + dy * dy;
 }
 
-function distance(aX: number, aY: number, bX: number, bY: number): number {
-  const square = distanceSq(aX, aY, bX, bY);
-  return square > 0 ? Math.sqrt(square) : 0;
+function randomCell(random: () => number, width: number, height: number): { x: number; y: number } {
+  return {
+    x: Math.floor(random() * width),
+    y: Math.floor(random() * height),
+  };
 }
 
-function validPosition(value: number, max: number): number {
-  return clamp(value, 0, max);
+function randomDirection(random: () => number) {
+  return DIRECTIONS[Math.floor(random() * DIRECTIONS.length)];
 }
 
-function wrapPosition(value: number, max: number): number {
-  if (value < 0) return max + value;
-  if (value > max) return value - max;
-  return value;
-}
-
-function localUncollectedWoodchips(
+function buildChipMaps(
   chips: Woodchip[],
-  x: number,
-  y: number,
-  radiusSq: number,
-): Woodchip[] {
-  return chips.filter((chip) => !chip.collected && distanceSq(x, y, chip.x, chip.y) <= radiusSq);
-}
+  width: number,
+): {
+  chipByCell: Map<number, number>;
+  chipIdToIndex: Map<string, number>;
+} {
+  const chipByCell = new Map<number, number>();
+  const chipIdToIndex = new Map<string, number>();
 
-function findNearbyEmptyDropSpot(
-  chips: Woodchip[],
-  originX: number,
-  originY: number,
-  world: WorldDimensions,
-  contactRadius: number,
-  searchRadius: number,
-  random: () => number,
-): { x: number; y: number } {
-  const emptyRadiusSq = contactRadius * contactRadius;
-
-  for (let attempt = 0; attempt < 24; attempt += 1) {
-    const angle = randomInRange(random, 0, TWO_PI);
-    const radius = randomInRange(random, contactRadius * 1.25, searchRadius);
-    const candidateX = wrapPosition(originX + Math.cos(angle) * radius, world.width);
-    const candidateY = wrapPosition(originY + Math.sin(angle) * radius, world.height);
-    const occupied = chips.some(
-      (chip) => !chip.collected && distanceSq(candidateX, candidateY, chip.x, chip.y) <= emptyRadiusSq,
-    );
-
-    if (!occupied) {
-      return { x: candidateX, y: candidateY };
+  for (let index = 0; index < chips.length; index += 1) {
+    const chip = chips[index];
+    chipIdToIndex.set(chip.id, index);
+    if (!chip.collected) {
+      chipByCell.set(cellKey(chip.x, chip.y, width), index);
     }
   }
 
-  return {
-    x: wrapPosition(originX + contactRadius * 1.5, world.width),
-    y: wrapPosition(originY, world.height),
-  };
+  return { chipByCell, chipIdToIndex };
+}
+
+function nearbyEmptyNeighbor(
+  x: number,
+  y: number,
+  chipByCell: Map<number, number>,
+  width: number,
+  height: number,
+  random: () => number,
+): { x: number; y: number } | null {
+  const start = Math.floor(random() * DIRECTIONS.length);
+
+  for (let offset = 0; offset < DIRECTIONS.length; offset += 1) {
+    const direction = DIRECTIONS[(start + offset) % DIRECTIONS.length];
+    const neighborX = wrapCoordinate(x + direction.dx, width);
+    const neighborY = wrapCoordinate(y + direction.dy, height);
+    const neighborKey = cellKey(neighborX, neighborY, width);
+
+    if (!chipByCell.has(neighborKey)) {
+      return { x: neighborX, y: neighborY };
+    }
+  }
+
+  return null;
+}
+
+function mutateSimulationStep(
+  state: SimulationState,
+  chipByCell: Map<number, number>,
+  chipIdToIndex: Map<string, number>,
+  options: StepOptions = {},
+): { pickups: number; drops: number } {
+  const { world } = state;
+  const { width, height } = normalizeWorld(world);
+  const moveDistance = Math.max(0, Math.round(options.moveDistance ?? DEFAULT_MOVE_DISTANCE));
+  let pickups = 0;
+  let drops = 0;
+
+  for (const termite of state.termites) {
+    const direction = randomDirection(options.random ?? Math.random);
+
+    if (moveDistance > 0) {
+      termite.x = wrapCoordinate(termite.x + direction.dx * moveDistance, width);
+      termite.y = wrapCoordinate(termite.y + direction.dy * moveDistance, height);
+    }
+
+    termite.heading = direction.heading;
+
+    const currentCellKey = cellKey(termite.x, termite.y, width);
+    const chipIndexAtCell = chipByCell.get(currentCellKey);
+
+    if (termite.carriedChipId === null) {
+      if (chipIndexAtCell !== undefined) {
+        const pickedChip = state.woodchips[chipIndexAtCell];
+        state.woodchips[chipIndexAtCell] = {
+          ...pickedChip,
+          collected: true,
+        };
+        chipByCell.delete(currentCellKey);
+        termite.carriedChipId = pickedChip.id;
+        pickups += 1;
+      }
+      continue;
+    }
+
+    if (chipIndexAtCell === undefined) {
+      continue;
+    }
+
+    const carriedChipIndex = chipIdToIndex.get(termite.carriedChipId);
+    if (carriedChipIndex === undefined) {
+      continue;
+    }
+
+    const dropCell = nearbyEmptyNeighbor(
+      termite.x,
+      termite.y,
+      chipByCell,
+      width,
+      height,
+      options.random ?? Math.random,
+    );
+
+    if (dropCell === null) {
+      continue;
+    }
+
+    const droppedChip = {
+      ...state.woodchips[carriedChipIndex],
+      x: dropCell.x,
+      y: dropCell.y,
+      collected: false,
+    };
+
+    state.woodchips[carriedChipIndex] = droppedChip;
+    chipByCell.set(cellKey(dropCell.x, dropCell.y, width), carriedChipIndex);
+    termite.carriedChipId = null;
+    drops += 1;
+
+    const escapeDirection = randomDirection(options.random ?? Math.random);
+    termite.x = wrapCoordinate(termite.x + escapeDirection.dx * POST_DROP_DISPLACEMENT, width);
+    termite.y = wrapCoordinate(termite.y + escapeDirection.dy * POST_DROP_DISPLACEMENT, height);
+    termite.heading = escapeDirection.heading;
+  }
+
+  state.tick += 1;
+  return { pickups, drops };
 }
 
 export function createSimulationState({
@@ -161,25 +262,58 @@ export function createSimulationState({
   woodchipCount,
   random = Math.random,
 }: SimulationConfig): SimulationState {
-  const termites: Termite[] = Array.from({ length: termiteCount }, () => ({
-    id: makeId('termite'),
-    x: validPosition(randomInRange(random, 0, world.width), world.width),
-    y: validPosition(randomInRange(random, 0, world.height), world.height),
-    heading: randomInRange(random, -Math.PI, Math.PI),
-    carriedChipId: null,
-  }));
+  const normalizedWorld = normalizeWorld(world);
+  const occupiedChipCells = new Set<number>();
+  const woodchips: Woodchip[] = [];
+  const totalCells = normalizedWorld.width * normalizedWorld.height;
 
-  const woodchips: Woodchip[] = Array.from({ length: woodchipCount }, () => ({
-    id: makeId('chip'),
-    x: validPosition(randomInRange(random, 0, world.width), world.width),
-    y: validPosition(randomInRange(random, 0, world.height), world.height),
-    collected: false,
-  }));
+  while (woodchips.length < woodchipCount) {
+    const startX = Math.floor(random() * normalizedWorld.width);
+    const startY = Math.floor(random() * normalizedWorld.height);
+    let placed = false;
+
+    for (let probe = 0; probe < totalCells; probe += 1) {
+      const candidateIndex = (startY * normalizedWorld.width + startX + probe) % totalCells;
+      const x = candidateIndex % normalizedWorld.width;
+      const y = Math.floor(candidateIndex / normalizedWorld.width);
+      const key = cellKey(x, y, normalizedWorld.width);
+
+      if (occupiedChipCells.has(key)) {
+        continue;
+      }
+
+      occupiedChipCells.add(key);
+      woodchips.push({
+        id: makeId('chip'),
+        x,
+        y,
+        collected: false,
+      });
+      placed = true;
+      break;
+    }
+
+    if (!placed) {
+      break;
+    }
+  }
+
+  const termites: Termite[] = Array.from({ length: termiteCount }, () => {
+    const direction = randomDirection(random);
+    const position = randomCell(random, normalizedWorld.width, normalizedWorld.height);
+    return {
+      id: makeId('termite'),
+      x: position.x,
+      y: position.y,
+      heading: direction.heading,
+      carriedChipId: null,
+    };
+  });
 
   return {
     isInitialized: true,
     tick: 0,
-    world,
+    world: normalizedWorld,
     termites,
     woodchips,
     signalFields: [],
@@ -206,91 +340,51 @@ export function perceiveForTermite(
   };
 }
 
-export function stepSimulation(state: SimulationState, options: StepOptions = {}): SimulationState {
-  const {
-    perceptionRadius = DEFAULT_PERCEPTION_RADIUS,
-    moveDistance = DEFAULT_MOVE_DISTANCE,
-    chipPickupRadius = DEFAULT_PICKUP_RADIUS,
-    chipClusterRadius = DEFAULT_DROP_CLUSTER_RADIUS,
-    random = Math.random,
-  } = options;
+export function advanceSimulation(
+  state: SimulationState,
+  steps: number,
+  options: StepOptions = {},
+): AdvanceResult {
+  const workingState: SimulationState = {
+    ...state,
+    termites: state.termites.map((termite) => ({ ...termite })),
+    woodchips: state.woodchips.map((chip) => ({ ...chip })),
+    signalFields: [],
+  };
 
-  const pickupRadiusSq = chipPickupRadius * chipPickupRadius;
-  const dropSearchRadius = Math.max(chipClusterRadius, chipPickupRadius * 1.5);
+  const { chipByCell, chipIdToIndex } = buildChipMaps(
+    workingState.woodchips,
+    workingState.world.width,
+  );
 
-  const nextWoodchips: Woodchip[] = state.woodchips.map((chip) => ({
-    ...chip,
-  }));
+  let pickups = 0;
+  let drops = 0;
+  const totalSteps = Math.max(0, Math.floor(steps));
 
-  const nextTermites: Termite[] = [];
-
-  for (const termite of state.termites) {
-    const nextHeading = normalizeAngle(
-      termite.heading + randomInRange(random, -DEFAULT_WANDER_JITTER, DEFAULT_WANDER_JITTER),
-    );
-    const steeringX = Math.cos(nextHeading);
-    const steeringY = Math.sin(nextHeading);
-    const normalizedMagnitude = Math.hypot(steeringX, steeringY) || 1;
-    const nextX = wrapPosition(termite.x + (steeringX / normalizedMagnitude) * moveDistance, state.world.width);
-    const nextY = wrapPosition(termite.y + (steeringY / normalizedMagnitude) * moveDistance, state.world.height);
-
-    const nextTermite: Termite = {
-      ...termite,
-      x: nextX,
-      y: nextY,
-      heading: nextHeading,
-      carriedChipId: termite.carriedChipId,
-    };
-
-    if (nextTermite.carriedChipId === null) {
-      const nearbyPickupCandidates = localUncollectedWoodchips(nextWoodchips, nextTermite.x, nextTermite.y, pickupRadiusSq);
-      if (nearbyPickupCandidates.length > 0) {
-        const pickedChip = nearbyPickupCandidates[0];
-        const chipIndex = nextWoodchips.findIndex((chip) => chip.id === pickedChip.id);
-        if (chipIndex >= 0) {
-          nextWoodchips[chipIndex].collected = true;
-          nextTermite.carriedChipId = pickedChip.id;
-        }
-      }
-    } else {
-      const nearbyDropCandidates = localUncollectedWoodchips(nextWoodchips, nextTermite.x, nextTermite.y, pickupRadiusSq);
-      if (nearbyDropCandidates.length > 0) {
-        const dropIndex = nextWoodchips.findIndex((chip) => chip.id === nextTermite.carriedChipId);
-        if (dropIndex >= 0) {
-          const dropSpot = findNearbyEmptyDropSpot(
-            nextWoodchips,
-            nextTermite.x,
-            nextTermite.y,
-            state.world,
-            chipPickupRadius,
-            dropSearchRadius,
-            random,
-          );
-          nextWoodchips[dropIndex] = {
-            ...nextWoodchips[dropIndex],
-            x: dropSpot.x,
-            y: dropSpot.y,
-            collected: false,
-          };
-          nextTermite.carriedChipId = null;
-        }
-      }
-    }
-
-    nextTermites.push(nextTermite);
+  for (let step = 0; step < totalSteps; step += 1) {
+    const result = mutateSimulationStep(workingState, chipByCell, chipIdToIndex, options);
+    pickups += result.pickups;
+    drops += result.drops;
   }
 
   return {
-    ...state,
-    tick: state.tick + 1,
-    termites: nextTermites,
-    woodchips: nextWoodchips,
-    signalFields: [],
+    state: workingState,
+    pickups,
+    drops,
   };
 }
 
+export function stepSimulation(state: SimulationState, options: StepOptions = {}): SimulationState {
+  return advanceSimulation(state, 1, options).state;
+}
+
 export { MIN_SIGNAL_INTENSITY };
-export function resetSimulation(world: WorldDimensions, termiteCount: number, woodchipCount: number): SimulationState {
+
+export function resetSimulation(
+  world: WorldDimensions,
+  termiteCount: number,
+  woodchipCount: number,
+): SimulationState {
   return createSimulationState({
     world,
     termiteCount,
