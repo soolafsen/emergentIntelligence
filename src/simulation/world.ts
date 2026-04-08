@@ -72,7 +72,9 @@ const DEFAULT_PICKUP_BIAS = 0.35;
 const DEFAULT_DROP_BIAS = 0.2;
 const DEFAULT_LOCAL_CUE_DENSITY_SCALE = 8;
 const DEFAULT_PICKUP_RADIUS = 14;
-const DEFAULT_DROP_CLUSTER_RADIUS = 22;
+const DEFAULT_DROP_CLUSTER_RADIUS = 28;
+const DEFAULT_WANDER_JITTER = 0.8;
+const MAX_SIGNAL_FIELDS = 1200;
 
 let nextId = 0;
 
@@ -114,6 +116,12 @@ function validPosition(value: number, max: number): number {
   return clamp(value, 0, max);
 }
 
+function wrapPosition(value: number, max: number): number {
+  if (value < 0) return max + value;
+  if (value > max) return value - max;
+  return value;
+}
+
 function pickNearest<T extends { x: number; y: number }>(origin: Termite, candidates: T[]): T {
   return candidates.reduce((best, candidate) => {
     const bestDistance = distanceSq(origin.x, origin.y, best.x, best.y);
@@ -129,6 +137,21 @@ function localUncollectedWoodchips(
   radiusSq: number,
 ): Woodchip[] {
   return chips.filter((chip) => !chip.collected && distanceSq(x, y, chip.x, chip.y) <= radiusSq);
+}
+
+function computeLocalChipDensity(chips: Woodchip[], x: number, y: number, radiusSq: number): number {
+  return localUncollectedWoodchips(chips, x, y, radiusSq).length;
+}
+
+function computeIsolationScore(chips: Woodchip[], chip: Woodchip, radiusSq: number, densityScale: number): number {
+  const localDensity = computeLocalChipDensity(chips, chip.x, chip.y, radiusSq);
+  const normalizedDensity = clamp((localDensity - 1) / Math.max(1, densityScale - 1), 0, 1);
+  return 1 - normalizedDensity;
+}
+
+function computeClusterScore(chips: Woodchip[], x: number, y: number, radiusSq: number, densityScale: number): number {
+  const localDensity = computeLocalChipDensity(chips, x, y, radiusSq);
+  return clamp(localDensity / Math.max(1, densityScale), 0, 1);
 }
 
 export function createSimulationState({
@@ -217,6 +240,7 @@ export function stepSimulation(state: SimulationState, options: StepOptions = {}
   }));
 
   const nextTermites: Termite[] = [];
+  const depositedSignals: SignalField[] = [];
 
   for (const termite of state.termites) {
     const { nearbyTermites, nearbyWoodchips, nearbySignals } = perceiveForTermite(
@@ -225,9 +249,9 @@ export function stepSimulation(state: SimulationState, options: StepOptions = {}
       perceptionRadius,
     );
 
-    // Start with gentle inertia so termites do not jitter at rest.
-    let steeringX = Math.cos(termite.heading) * 0.25;
-    let steeringY = Math.sin(termite.heading) * 0.25;
+    const wanderHeading = randomInRange(random, -Math.PI, Math.PI);
+    let steeringX = Math.cos(termite.heading) * 0.45 + Math.cos(wanderHeading) * DEFAULT_WANDER_JITTER;
+    let steeringY = Math.sin(termite.heading) * 0.45 + Math.sin(wanderHeading) * DEFAULT_WANDER_JITTER;
 
     // Strong avoid when another termite is inside the collision radius.
     let avoidX = 0;
@@ -246,25 +270,46 @@ export function stepSimulation(state: SimulationState, options: StepOptions = {}
     const hasCloseCollision = collisionAvoidance > 0.01;
 
     if (!hasCloseCollision) {
-      // When not strongly avoiding, follow local chips first (when not carrying), else local signals.
       if (termite.carriedChipId === null && nearbyWoodchips.length > 0) {
-        const targetChip = pickNearest(termite, nearbyWoodchips);
-        const chipDistance = Math.max(
-          1,
-          distance(termite.x, termite.y, targetChip.x, targetChip.y),
-        );
-        steeringX += ((targetChip.x - termite.x) / chipDistance) * chipSeekStrength;
-        steeringY += ((targetChip.y - termite.y) / chipDistance) * chipSeekStrength;
+        const targetChip = nearbyWoodchips.reduce((best, candidate) => {
+          const bestScore =
+            computeIsolationScore(nextWoodchips, best, clusterRadiusSq, cueDensityScale) /
+            Math.max(1, distance(termite.x, termite.y, best.x, best.y));
+          const candidateScore =
+            computeIsolationScore(nextWoodchips, candidate, clusterRadiusSq, cueDensityScale) /
+            Math.max(1, distance(termite.x, termite.y, candidate.x, candidate.y));
+          return candidateScore > bestScore ? candidate : best;
+        }, nearbyWoodchips[0]);
+        const chipDistance = Math.max(1, distance(termite.x, termite.y, targetChip.x, targetChip.y));
+        steeringX += ((targetChip.x - termite.x) / chipDistance) * (chipSeekStrength * 1.35);
+        steeringY += ((targetChip.y - termite.y) / chipDistance) * (chipSeekStrength * 1.35);
+      } else if (termite.carriedChipId !== null && nearbyWoodchips.length > 0) {
+        const localCluster = nearbyWoodchips.reduce((best, candidate) => {
+          const bestScore =
+            computeClusterScore(nextWoodchips, best.x, best.y, clusterRadiusSq, cueDensityScale) /
+            Math.max(1, distance(termite.x, termite.y, best.x, best.y));
+          const candidateScore =
+            computeClusterScore(nextWoodchips, candidate.x, candidate.y, clusterRadiusSq, cueDensityScale) /
+            Math.max(1, distance(termite.x, termite.y, candidate.x, candidate.y));
+          return candidateScore > bestScore ? candidate : best;
+        }, nearbyWoodchips[0]);
+        const clusterDistance = Math.max(1, distance(termite.x, termite.y, localCluster.x, localCluster.y));
+        steeringX += ((localCluster.x - termite.x) / clusterDistance) * (chipSeekStrength * 1.15);
+        steeringY += ((localCluster.y - termite.y) / clusterDistance) * (chipSeekStrength * 1.15);
+      } else if (termite.carriedChipId !== null && nearbySignals.length > 0) {
+        const strongestSignal = nearbySignals.reduce((best, candidate) => {
+          return candidate.intensity > best.intensity ? candidate : best;
+        }, nearbySignals[0]);
+        const signalDistance = Math.max(1, distance(termite.x, termite.y, strongestSignal.x, strongestSignal.y));
+        steeringX += ((strongestSignal.x - termite.x) / signalDistance) * signalFollowStrength;
+        steeringY += ((strongestSignal.y - termite.y) / signalDistance) * signalFollowStrength;
       } else if (nearbySignals.length > 0) {
         const strongestSignal = nearbySignals.reduce((best, candidate) => {
           return candidate.intensity > best.intensity ? candidate : best;
         }, nearbySignals[0]);
-        const signalDistance = Math.max(
-          1,
-          distance(termite.x, termite.y, strongestSignal.x, strongestSignal.y),
-        );
-        steeringX += ((strongestSignal.x - termite.x) / signalDistance) * signalFollowStrength;
-        steeringY += ((strongestSignal.y - termite.y) / signalDistance) * signalFollowStrength;
+        const signalDistance = Math.max(1, distance(termite.x, termite.y, strongestSignal.x, strongestSignal.y));
+        steeringX += ((strongestSignal.x - termite.x) / signalDistance) * (signalFollowStrength * 0.55);
+        steeringY += ((strongestSignal.y - termite.y) / signalDistance) * (signalFollowStrength * 0.55);
       }
     } else {
       // Strong local-collision pressure takes precedence.
@@ -272,24 +317,11 @@ export function stepSimulation(state: SimulationState, options: StepOptions = {}
       steeringY += avoidY * 1.8;
     }
 
-    // Carrying termites still keep some cue following to keep them in visible clusters.
-    if (termite.carriedChipId !== null && nearbySignals.length > 0 && !hasCloseCollision) {
-      const signalLeader = nearbySignals.reduce((best, candidate) => {
-        return candidate.intensity > best.intensity ? candidate : best;
-      }, nearbySignals[0]);
-      const signalDistance = Math.max(
-        1,
-        distance(termite.x, termite.y, signalLeader.x, signalLeader.y),
-      );
-      steeringX += ((signalLeader.x - termite.x) / signalDistance) * (signalFollowStrength * 0.6);
-      steeringY += ((signalLeader.y - termite.y) / signalDistance) * (signalFollowStrength * 0.6);
-    }
-
     const heading = Math.atan2(steeringY, steeringX);
 
     const normalizedMagnitude = Math.hypot(steeringX, steeringY) || 1;
-    const nextX = validPosition(termite.x + (steeringX / normalizedMagnitude) * moveDistance, state.world.width);
-    const nextY = validPosition(termite.y + (steeringY / normalizedMagnitude) * moveDistance, state.world.height);
+    const nextX = wrapPosition(termite.x + (steeringX / normalizedMagnitude) * moveDistance, state.world.width);
+    const nextY = wrapPosition(termite.y + (steeringY / normalizedMagnitude) * moveDistance, state.world.height);
 
     const nextTermite: Termite = {
       ...termite,
@@ -309,35 +341,55 @@ export function stepSimulation(state: SimulationState, options: StepOptions = {}
       );
 
       if (nearbyPickupCandidates.length > 0) {
+        const pickedChip = nearbyPickupCandidates.reduce((best, candidate) => {
+          const bestScore =
+            computeIsolationScore(nextWoodchips, best, clusterRadiusSq, cueDensityScale) /
+            Math.max(1, distance(nextTermite.x, nextTermite.y, best.x, best.y));
+          const candidateScore =
+            computeIsolationScore(nextWoodchips, candidate, clusterRadiusSq, cueDensityScale) /
+            Math.max(1, distance(nextTermite.x, nextTermite.y, candidate.x, candidate.y));
+          return candidateScore > bestScore ? candidate : best;
+        }, nearbyPickupCandidates[0]);
         const cueDensity = Math.min(1, nearbySignals.length / cueDensityScale);
-        const pickupProbability = clamp(chipPickupBias * (1 - cueDensity), 0, 1);
+        const isolationScore = computeIsolationScore(nextWoodchips, pickedChip, clusterRadiusSq, cueDensityScale);
+        const pickupProbability = clamp(chipPickupBias * isolationScore * (1 - cueDensity), 0, 1);
 
         if (random() < pickupProbability) {
-          const pickedChip = pickNearest(nextTermite, nearbyPickupCandidates);
           const chipIndex = nextWoodchips.findIndex((chip) => chip.id === pickedChip.id);
           if (chipIndex >= 0) {
             nextWoodchips[chipIndex].collected = true;
             nextTermite.carriedChipId = pickedChip.id;
+            depositedSignals.push({
+              id: makeId('signal'),
+              x: nextTermite.x,
+              y: nextTermite.y,
+              intensity: signalDeposit * 0.5,
+            });
           }
         }
       }
     } else {
-      // Drop behavior: prefer dropping where cluster cues are visible, otherwise stochastic drop rule.
       const nearbyDropCandidates = localUncollectedWoodchips(
         nextWoodchips,
         nextTermite.x,
         nextTermite.y,
         clusterRadiusSq,
       );
-
-      const localClusterDensity = Math.min(
-        1,
-        (nearbyDropCandidates.length + nearbySignals.length * 0.5) / cueDensityScale,
+      const localClusterScore = computeClusterScore(
+        nextWoodchips,
+        nextTermite.x,
+        nextTermite.y,
+        clusterRadiusSq,
+        cueDensityScale,
       );
-      const shouldDropByRule = random() < chipDropBias * (0.35 + localClusterDensity);
-      const nearCluster = nearbyDropCandidates.length > 0;
+      const localSignalScore = Math.min(1, nearbySignals.length / cueDensityScale);
+      const dropProbability = clamp(
+        chipDropBias * (0.15 + localClusterScore * 0.95 + localSignalScore * 0.4),
+        0,
+        1,
+      );
 
-      if (nearCluster || shouldDropByRule) {
+      if (nearbyDropCandidates.length > 0 || random() < dropProbability) {
         const dropIndex = nextWoodchips.findIndex((chip) => chip.id === nextTermite.carriedChipId);
         if (dropIndex >= 0) {
           nextWoodchips[dropIndex] = {
@@ -347,21 +399,27 @@ export function stepSimulation(state: SimulationState, options: StepOptions = {}
             collected: false,
           };
           nextTermite.carriedChipId = null;
+          depositedSignals.push({
+            id: makeId('signal'),
+            x: nextTermite.x,
+            y: nextTermite.y,
+            intensity: signalDeposit * 1.8,
+          });
         }
+      } else {
+        depositedSignals.push({
+          id: makeId('signal'),
+          x: nextTermite.x,
+          y: nextTermite.y,
+          intensity: signalDeposit * 0.35,
+        });
       }
     }
 
     nextTermites.push(nextTermite);
   }
 
-  const nextSignals = nextSignalFields.concat(
-    nextTermites.map((termite) => ({
-      id: makeId('signal'),
-      x: termite.x,
-      y: termite.y,
-      intensity: signalDeposit,
-    })),
-  );
+  const nextSignals = nextSignalFields.concat(depositedSignals).slice(-MAX_SIGNAL_FIELDS);
 
   return {
     ...state,

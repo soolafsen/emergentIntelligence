@@ -5,6 +5,7 @@ import {
   stepSimulation,
   type SimulationState,
   type Termite,
+  type Woodchip,
 } from './simulation/world';
 import { ControlsPanel } from './ui/controls/ControlsPanel';
 
@@ -128,25 +129,27 @@ function computePickupAndDropEvents(previous: Termite[], next: Termite[]): Throu
   return { pickups, drops };
 }
 
-function computeLocalClusterDensity(termites: Termite[]): number {
-  if (termites.length < 2) {
+function computeLocalClusterDensity(woodchips: Woodchip[]): number {
+  const visibleWoodchips = woodchips.filter((chip) => !chip.collected);
+
+  if (visibleWoodchips.length < 2) {
     return 0;
   }
 
   const clusterRadiusSq = CLUSTER_RADIUS * CLUSTER_RADIUS;
   let pairConnections = 0;
 
-  for (let i = 0; i < termites.length - 1; i += 1) {
-    const source = termites[i];
-    for (let j = i + 1; j < termites.length; j += 1) {
-      const target = termites[j];
+  for (let i = 0; i < visibleWoodchips.length - 1; i += 1) {
+    const source = visibleWoodchips[i];
+    for (let j = i + 1; j < visibleWoodchips.length; j += 1) {
+      const target = visibleWoodchips[j];
       if (distanceSq(source.x, source.y, target.x, target.y) <= clusterRadiusSq) {
         pairConnections += 1;
       }
     }
   }
 
-  return Number(((pairConnections * 2) / termites.length).toFixed(2));
+  return Number(((pairConnections * 2) / visibleWoodchips.length).toFixed(2));
 }
 
 function formatFloat(value: number): string {
@@ -253,7 +256,7 @@ export function App() {
           drops: currentThroughput.drops + transitions.drops,
         }));
 
-        const nextDensity = computeLocalClusterDensity(nextState.termites);
+        const nextDensity = computeLocalClusterDensity(nextState.woodchips);
         setClusterMetrics((current) => ({
           density: nextDensity,
           trend: Number(formatFloat(nextDensity - current.density)),

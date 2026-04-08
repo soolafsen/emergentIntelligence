@@ -47,11 +47,14 @@ assert(
   'All woodchips are spawned within world bounds',
 );
 
-const next = stepSimulation(generated);
+const next = stepSimulation(generated, {
+  signalDeposit: 0,
+  random: () => 0.99,
+});
 assert(next.tick === 1, 'stepSimulation must increment tick');
 assert(
-  next.signalFields.length > 0,
-  'Simulation step should update and carry signal fields',
+  next.signalFields.length === 0,
+  'Idle termites should not flood the world with signal fields every step.',
 );
 
 const localState = {
@@ -64,6 +67,7 @@ const localState = {
       x: 50,
       y: 60,
       heading: 0,
+      carriedChipId: null,
     },
   ],
   woodchips: [
@@ -90,9 +94,10 @@ const signalOnly = {
       x: 30,
       y: 30,
       heading: 0,
+      carriedChipId: 'payload',
     },
   ],
-  woodchips: [],
+  woodchips: [{ id: 'payload', x: 30, y: 30, collected: true }],
 };
 
 const decayed = stepSimulation(signalOnly, { signalDecay: 0.4, signalDeposit: 0, minSignalIntensity: 0.1, perceptionRadius: 30 });
